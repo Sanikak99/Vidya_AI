@@ -1,29 +1,29 @@
-import os, re, time, threading, pickle
+import os, re, time, json, math
 from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-# ── Lightweight imports only ──────────────────────────────────────────────────
-import fitz                                      # pymupdf  — read PDFs
-import numpy as np                               # numpy    — vector math
-from google import genai                         # google-genai — LLM + embeddings
-from google.genai import types
+import numpy as np
+import faiss
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-client = genai.Client(api_key=GOOGLE_API_KEY)
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return "OK", 200
+    return jsonify({"status": "alive", "ready": _app_ready}), 200
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = """"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -715,18 +715,18 @@ HTML_PAGE = """<!DOCTYPE html>
 
   function parseMarkdown(text) {
     let t = escapeHtml(text);
-    t = t.replace(/^#{1,6}\\\\s+(.+)$/gm, "<strong style='font-size:1.05rem;display:block;margin:8px 0 4px'>$1</strong>");
-    t = t.replace(/\\\\*\\\\*(.+?)\\\\*\\\\*/g, "<strong>$1</strong>");
+    t = t.replace(/^#{1,6}\\s+(.+)$/gm, "<strong style='font-size:1.05rem;display:block;margin:8px 0 4px'>$1</strong>");
+    t = t.replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>");
     t = t.replace(/__(.+?)__/g, "<strong>$1</strong>");
-    t = t.replace(/^[\\\\*\\\\-]\\\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
-    t = t.replace(/^\\\\d+\\\\.\\\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
-    t = t.replace(/(<li[^>]*>.*?<\\\\/li>)/gs, function(m) { return "<ul style='padding-left:20px;margin:6px 0'>" + m + "</ul>"; });
-    t = t.replace(/\\\\*([^\\\\*]+?)\\\\*/g, "<em>$1</em>");
+    t = t.replace(/^[\\*\\-]\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
+    t = t.replace(/^\\d+\\.\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
+    t = t.replace(/(<li[^>]*>.*?<\\/li>)/gs, function(m) { return "<ul style='padding-left:20px;margin:6px 0'>" + m + "</ul>"; });
+    t = t.replace(/\\*([^\\*]+?)\\*/g, "<em>$1</em>");
     t = t.replace(/_([^_]+?)_/g, "<em>$1</em>");
     t = t.replace(/`([^`]+?)`/g, "<code style='background:#f0f2fa;padding:2px 6px;border-radius:4px;font-size:.88em;font-family:monospace'>$1</code>");
     t = t.replace(/^---+$/gm, "<hr style='border:none;border-top:1px solid #e0e4f0;margin:10px 0'>");
-    t = t.replace(/\\\\n\\\\n/g, "<br><br>");
-    t = t.replace(/\\\\n/g, "<br>");
+    t = t.replace(/\\n\\n/g, "<br><br>");
+    t = t.replace(/\\n/g, "<br>");
     return t;
   }
 
@@ -740,7 +740,7 @@ HTML_PAGE = """<!DOCTYPE html>
       bubble.className = "bubble";
       bubble.innerHTML = parseMarkdown(text);
 
-      const plain = text.replace(/[#*_`>~]/g, "").replace(/<[^>]*>/g, "").replace(/\\\\s+/g, " ").trim();
+      const plain = text.replace(/[#*_`>~]/g, "").replace(/<[^>]*>/g, "").replace(/\\s+/g, " ").trim();
 
       const vBtn = document.createElement("button");
       vBtn.className = "voice-btn";
@@ -887,7 +887,7 @@ HTML_PAGE = """<!DOCTYPE html>
   function startMic() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      alert("Sorry! Your browser does not support speech input.\\\\nPlease use Google Chrome.");
+      alert("Sorry! Your browser does not support speech input.\\nPlease use Google Chrome.");
       return;
     }
 
@@ -945,7 +945,7 @@ HTML_PAGE = """<!DOCTYPE html>
       input.classList.remove("listening");
       input.placeholder = "Ask your question here… 😊";
       if (e.error === "not-allowed") {
-        alert("Microphone access denied.\\\\nPlease allow microphone permission in your browser.");
+        alert("Microphone access denied.\\nPlease allow microphone permission in your browser.");
       } else if (e.error === "no-speech") {
         input.placeholder = "No speech heard. Try again… 😊";
         setTimeout(() => {
@@ -981,86 +981,86 @@ def index():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LIGHTWEIGHT RAG — no LangChain, no ChromaDB, no HuggingFace
-#  Uses: PyMuPDF (read PDF) + NumPy (cosine similarity) + Google Embeddings API
+#  RAG — Google Embeddings + FAISS (pre-built indexes loaded from disk)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def read_pdf_chunks(pdf_path, chunk_size=500, overlap=100):
-    """Read PDF and split into overlapping text chunks."""
-    doc   = fitz.open(pdf_path)
-    text  = "\n".join(page.get_text() for page in doc)
-    words = text.split()
-    chunks = []
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i:i+chunk_size])
-        if chunk.strip():
-            chunks.append(chunk)
-        i += chunk_size - overlap
-    return chunks
+def get_embedding(text):
+    """Get single embedding from Google API."""
+    try:
+        result = genai.embed_content(
+            model="models/gemini-embedding-001",
+            content=text,
+            task_type="retrieval_query"
+        )
+        return result["embedding"]
+    except Exception as e:
+        print(f"❌ Embedding error: {e}")
+        return None
 
-def get_embeddings(texts):
-    """Get embeddings from Google API for a list of texts."""
-    result = client.models.embed_content(
-        model="models/text-embedding-004",
-        contents=texts,
-    )
-    return np.array([e.values for e in result.embeddings], dtype=np.float32)
+def cosine_similarity(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x*x for x in a))
+    mag_b = math.sqrt(sum(x*x for x in b))
+    if mag_a == 0 or mag_b == 0:
+        return 0
+    return dot / (mag_a * mag_b)
 
-def cosine_similarity(query_vec, doc_vecs):
-    """Compute cosine similarity between query and all docs."""
-    q = query_vec / (np.linalg.norm(query_vec) + 1e-10)
-    d = doc_vecs / (np.linalg.norm(doc_vecs, axis=1, keepdims=True) + 1e-10)
-    return d @ q
+def semantic_search(query, faiss_index, chunks, k=8):
+    """Search using FAISS."""
+    q_emb = get_embedding(query)
+    if q_emb is None:
+        print(f"⚠️  Embedding failed! Falling back to keyword search")
+        return keyword_search(query, chunks, k)
 
-def build_index(pdf_path, index_path):
-    """Build or load a simple FAISS-free vector index (numpy + pickle)."""
-    if os.path.exists(index_path):
-        print(f"✅ Loading index from {index_path}...")
-        with open(index_path, "rb") as f:
-            return pickle.load(f)
+    q_vec = np.array([q_emb], dtype=np.float32)
+    faiss.normalize_L2(q_vec)
+    distances, indices = faiss_index.search(q_vec, k)
+    
+    selected = [chunks[i] for i in indices[0] if i < len(chunks)]
+    print(f"🔍 Semantic search: query='{query[:40]}...' | k={k} | found={len(selected)} | distances={distances[0][:3]}")
+    return selected
 
-    print(f"🔨 Building index from {pdf_path}...")
-    chunks = read_pdf_chunks(pdf_path)
-    # embed in batches of 50 (API limit)
-    all_vecs = []
-    for i in range(0, len(chunks), 50):
-        batch = chunks[i:i+50]
-        vecs  = get_embeddings(batch)
-        all_vecs.append(vecs)
-    vectors = np.vstack(all_vecs)
-    index   = {"chunks": chunks, "vectors": vectors}
-    with open(index_path, "wb") as f:
-        pickle.dump(index, f)
-    print(f"✅ Index built and saved to {index_path}!")
-    return index
+def keyword_search(query, chunks, k=8):
+    """Fallback keyword search."""
+    keywords = query.lower().split()
+    scored = []
+    for i, chunk in enumerate(chunks):
+        chunk_lower = chunk.lower()
+        score = sum(chunk_lower.count(kw) for kw in keywords)
+        if query.lower() in chunk_lower:
+            score += 100
+        if score > 0:
+            scored.append((score, i))
+    scored.sort(reverse=True)
+    return [chunks[i] for _, i in scored[:k]]
 
-def retrieve(query, index, k=8):
-    """Retrieve top-k most relevant chunks for a query."""
-    q_vec   = get_embeddings([query])[0]
-    scores  = cosine_similarity(q_vec, index["vectors"])
-    top_k   = np.argsort(scores)[::-1][:k]
-    return [index["chunks"][i] for i in top_k]
-
-def ask_gemini(question, context, system_prompt):
-    """Call Gemini with context and question."""
+def ask_gemini(question, context, system_prompt, history_text=""):
+    """Call Gemini with context."""
     prompt = f"""System: {system_prompt}
+"""
+    if history_text:
+        prompt += f"Previous conversation:\n{history_text}\n"
 
+    prompt += f"""
 Context from textbook:
 {context}
 
 Student Question: {question}
 
 Answer:"""
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.5,
-            max_output_tokens=1000,
+
+    try:
+        model = genai.GenerativeModel("models/gemma-3-4b-it")
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.5,
+                max_output_tokens=1000,
+            )
         )
-    )
-    return response.text
+        return response.text.strip()
+    except Exception as e:
+        raise e
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1068,8 +1068,8 @@ Answer:"""
 # ══════════════════════════════════════════════════════════════════════════════
 SUBJECTS_CONFIG = {
     "maths": {
-        "pdf":    "maths.pdf",
-        "index":  "maths_index.pkl",
+        "index":  "maths_faiss.index",
+        "chunks": "maths_chunks.json",
         "system": """You are a kind and friendly primary school teacher teaching Mathematics.
 Rules:
 - Always answer in very simple English.
@@ -1080,8 +1080,8 @@ Rules:
 - If the answer is not in the context, politely say I dont know."""
     },
     "marathi": {
-        "pdf":    "marathi.pdf",
-        "index":  "marathi_index.pkl",
+        "index":  "marathi_faiss.index",
+        "chunks": "marathi_chunks.json",
         "system": """तुम्ही एक प्रेमळ प्राथमिक शाळेचे मराठी शिक्षक आहात.
 नियम:
 - नेहमी मराठी भाषेत देवनागरी लिपीत उत्तर द्या.
@@ -1091,8 +1091,8 @@ Rules:
 - जर माहिती नसेल तर नम्रपणे सांगा मला माहीत नाही."""
     },
     "english": {
-        "pdf":    "english.pdf",
-        "index":  "english_index.pkl",
+        "index":  "english_faiss.index",
+        "chunks": "english_chunks.json",
         "system": """You are a kind and friendly primary school teacher teaching English.
 Rules:
 - Always answer in simple English with very easy words.
@@ -1103,41 +1103,57 @@ Rules:
     }
 }
 
-# In-memory conversation history per session
 conversation_history = {}
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  STARTUP — build indexes in background
+#  STARTUP — load pre-built FAISS indexes from disk (like hospital project)
 # ══════════════════════════════════════════════════════════════════════════════
-indexes   = {}
-_app_ready = False
+faiss_indexes = {}
+chunks_store  = {}
+_app_ready    = False
 
 def _load_all():
-    global indexes, _app_ready
+    global faiss_indexes, chunks_store, _app_ready
     try:
-        print("\n📚 Building/loading indexes...")
+        print("\n📚 Loading pre-built FAISS indexes...")
         for subject, cfg in SUBJECTS_CONFIG.items():
-            indexes[subject] = build_index(cfg["pdf"], cfg["index"])
+            idx_path    = cfg["index"]
+            chunks_path = cfg["chunks"]
+
+            if not os.path.exists(idx_path) or not os.path.exists(chunks_path):
+                print(f"⚠️  Missing index files for {subject} — skipping")
+                continue
+
+            index = faiss.read_index(idx_path)
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            faiss_indexes[subject] = index
+            chunks_store[subject]  = chunks
+            print(f"  ✅ {subject}: {index.ntotal} vectors, {len(chunks)} chunks")
+
         _app_ready = True
-        print("🎉 All indexes ready!\n")
+        print("🎉 All indexes loaded!\n")
     except Exception as e:
         print(f"❌ Startup error: {e}")
         import traceback; traceback.print_exc()
 
+import threading
 threading.Thread(target=_load_all, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  RATE LIMITING
 # ══════════════════════════════════════════════════════════════════════════════
-LIMITS = {"rpm_max": 4, "rpd_max": 18, "tpm_max": 200_000}
+LIMITS = {"rpm_max": 10, "rpd_max": 100, "tpm_max": 200000}
 state  = {"minute_requests": 0, "minute_tokens": 0, "day_requests": 0,
           "minute_window_start": time.time(), "day_window_start": time.time()}
 lock   = threading.Lock()
 
 def estimate_tokens(text): return max(1, len(text) // 4)
 
-def reset_windows_if_needed():
+def reset_windows():
     now = time.time()
     if now - state["minute_window_start"] >= 60:
         state["minute_requests"] = state["minute_tokens"] = 0
@@ -1148,8 +1164,9 @@ def reset_windows_if_needed():
 
 def check_and_update(question, context):
     with lock:
-        reset_windows_if_needed()
+        reset_windows()
         est = estimate_tokens(question + context)
+        print(f"📊 Token estimate: question={len(question)} chars | context={len(context)} chars | total_est={est} tokens")
         if state["day_requests"] >= LIMITS["rpd_max"]:
             rem = 86400 - (time.time() - state["day_window_start"])
             return False, f"Daily limit reached. Resets in {int(rem//3600)}h {int((rem%3600)//60)}m. 😊"
@@ -1178,33 +1195,22 @@ def ask():
     question = data.get("question", "").strip()
     session  = data.get("session_id", "default")
 
-    if not question:           return jsonify({"error": "Empty question"}), 400
-    if subject not in indexes: return jsonify({"error": "Unknown subject"}), 400
+    if not question:                 return jsonify({"error": "Empty question"}), 400
+    if subject not in faiss_indexes: return jsonify({"error": "Unknown subject"}), 400
 
-    # retrieve context
-    chunks  = retrieve(question, indexes[subject], k=8)
+    chunks  = semantic_search(question, faiss_indexes[subject], chunks_store[subject], k=4)
     context = "\n\n".join(chunks)
 
     allowed, reason = check_and_update(question, context)
     if not allowed: return jsonify({"error": reason}), 429
 
-    # build conversation context (last 4 exchanges)
-    history = conversation_history.get(session + subject, [])
-    history_text = ""
-    for h in history[-4:]:
-        history_text += f"Student: {h['q']}\nTeacher: {h['a']}\n\n"
-
-    system = SUBJECTS_CONFIG[subject]["system"]
-    full_system = system
-    if history_text:
-        full_system += f"\n\nPrevious conversation:\n{history_text}"
+    history      = conversation_history.get(session + subject, [])
+    history_text = "".join(f"Student: {h['q']}\nTeacher: {h['a']}\n\n" for h in history[-4:])
+    system       = SUBJECTS_CONFIG[subject]["system"]
 
     try:
-        answer = ask_gemini(question, context, full_system)
-        # save to history
-        if session + subject not in conversation_history:
-            conversation_history[session + subject] = []
-        conversation_history[session + subject].append({"q": question, "a": answer})
+        answer = ask_gemini(question, context, system, history_text)
+        conversation_history.setdefault(session + subject, []).append({"q": question, "a": answer})
         return jsonify({"answer": answer})
     except Exception as e:
         err = str(e)
@@ -1214,14 +1220,14 @@ def ask():
             return jsonify({"error": f"⏳ API quota reached.{wait} Come back tomorrow!"}), 429
         return jsonify({"error": f"Something went wrong: {err[:200]}"}), 500
 
-@app.route("/ready", methods=["GET"])
+@app.route("/ready")
 def ready():
     return jsonify({"ready": _app_ready, "message": "Warming up..." if not _app_ready else "All good!"})
 
-@app.route("/status", methods=["GET"])
+@app.route("/status")
 def status():
     with lock:
-        reset_windows_if_needed()
+        reset_windows()
         return jsonify({
             "minute_requests": f"{state['minute_requests']} / {LIMITS['rpm_max']}",
             "minute_tokens":   f"{state['minute_tokens']} / {LIMITS['tpm_max']}",
