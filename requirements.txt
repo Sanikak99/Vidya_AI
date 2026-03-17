@@ -1,7 +1,7 @@
 flask
 flask-cors
 python-dotenv
-pymupdf
 numpy
-google-genai
+faiss-cpu
+google-generativeai
 gunicorn
