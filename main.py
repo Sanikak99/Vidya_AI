@@ -23,7 +23,7 @@ def ping():
     return "pong", 200
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
-HTML_PAGE = """"<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
