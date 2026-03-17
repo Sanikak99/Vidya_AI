@@ -977,6 +977,7 @@ def index():
 # ══════════════════════════════════════════════════════════════════════════════
 #  MATHS
 # ══════════════════════════════════════════════════════════════════════════════
+print("⏳ Loading models...")
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -986,7 +987,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables import RunnableWithMessageHistory
 from langchain_core.documents import Document
 import fitz
-
+print("Done!")
 def build_maths(embeddings):
     PERSIST_DIR = "maths_db"
     if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
