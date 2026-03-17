@@ -1,22 +1,28 @@
+import os, re, time, threading, pickle
 from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from langchain_huggingface import HuggingFaceEmbeddings
-import os, time, threading
+
+# ── Lightweight imports only ──────────────────────────────────────────────────
+import fitz                                      # pymupdf  — read PDFs
+import numpy as np                               # numpy    — vector math
+from google import genai                         # google-genai — LLM + embeddings
+from google.genai import types
 
 app = Flask(__name__)
 CORS(app)
 
-# Health check — responds instantly so Render detects port immediately
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+client = genai.Client(api_key=GOOGLE_API_KEY)
+
+# ── Health check ──────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
     return "OK", 200
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SERVE FRONTEND
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Frontend ──────────────────────────────────────────────────────────────────
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -709,18 +715,18 @@ HTML_PAGE = """<!DOCTYPE html>
 
   function parseMarkdown(text) {
     let t = escapeHtml(text);
-    t = t.replace(/^#{1,6}\\s+(.+)$/gm, "<strong style='font-size:1.05rem;display:block;margin:8px 0 4px'>$1</strong>");
-    t = t.replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>");
+    t = t.replace(/^#{1,6}\\\\s+(.+)$/gm, "<strong style='font-size:1.05rem;display:block;margin:8px 0 4px'>$1</strong>");
+    t = t.replace(/\\\\*\\\\*(.+?)\\\\*\\\\*/g, "<strong>$1</strong>");
     t = t.replace(/__(.+?)__/g, "<strong>$1</strong>");
-    t = t.replace(/^[\\*\\-]\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
-    t = t.replace(/^\\d+\\.\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
-    t = t.replace(/(<li[^>]*>.*?<\\/li>)/gs, function(m) { return "<ul style='padding-left:20px;margin:6px 0'>" + m + "</ul>"; });
-    t = t.replace(/\\*([^\\*]+?)\\*/g, "<em>$1</em>");
+    t = t.replace(/^[\\\\*\\\\-]\\\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
+    t = t.replace(/^\\\\d+\\\\.\\\\s+(.+)$/gm, "<li style='margin:4px 0'>$1</li>");
+    t = t.replace(/(<li[^>]*>.*?<\\\\/li>)/gs, function(m) { return "<ul style='padding-left:20px;margin:6px 0'>" + m + "</ul>"; });
+    t = t.replace(/\\\\*([^\\\\*]+?)\\\\*/g, "<em>$1</em>");
     t = t.replace(/_([^_]+?)_/g, "<em>$1</em>");
     t = t.replace(/`([^`]+?)`/g, "<code style='background:#f0f2fa;padding:2px 6px;border-radius:4px;font-size:.88em;font-family:monospace'>$1</code>");
     t = t.replace(/^---+$/gm, "<hr style='border:none;border-top:1px solid #e0e4f0;margin:10px 0'>");
-    t = t.replace(/\\n\\n/g, "<br><br>");
-    t = t.replace(/\\n/g, "<br>");
+    t = t.replace(/\\\\n\\\\n/g, "<br><br>");
+    t = t.replace(/\\\\n/g, "<br>");
     return t;
   }
 
@@ -734,7 +740,7 @@ HTML_PAGE = """<!DOCTYPE html>
       bubble.className = "bubble";
       bubble.innerHTML = parseMarkdown(text);
 
-      const plain = text.replace(/[#*_`>~]/g, "").replace(/<[^>]*>/g, "").replace(/\\s+/g, " ").trim();
+      const plain = text.replace(/[#*_`>~]/g, "").replace(/<[^>]*>/g, "").replace(/\\\\s+/g, " ").trim();
 
       const vBtn = document.createElement("button");
       vBtn.className = "voice-btn";
@@ -881,7 +887,7 @@ HTML_PAGE = """<!DOCTYPE html>
   function startMic() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
-      alert("Sorry! Your browser does not support speech input.\\nPlease use Google Chrome.");
+      alert("Sorry! Your browser does not support speech input.\\\\nPlease use Google Chrome.");
       return;
     }
 
@@ -939,7 +945,7 @@ HTML_PAGE = """<!DOCTYPE html>
       input.classList.remove("listening");
       input.placeholder = "Ask your question here… 😊";
       if (e.error === "not-allowed") {
-        alert("Microphone access denied.\\nPlease allow microphone permission in your browser.");
+        alert("Microphone access denied.\\\\nPlease allow microphone permission in your browser.");
       } else if (e.error === "no-speech") {
         input.placeholder = "No speech heard. Try again… 😊";
         setTimeout(() => {
@@ -975,170 +981,149 @@ def index():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MATHS
+#  LIGHTWEIGHT RAG — no LangChain, no ChromaDB, no HuggingFace
+#  Uses: PyMuPDF (read PDF) + NumPy (cosine similarity) + Google Embeddings API
 # ══════════════════════════════════════════════════════════════════════════════
-print("⏳ Loading models...")
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.runnables import RunnableWithMessageHistory
-from langchain_core.documents import Document
-import fitz
-print("Done!")
-def build_maths(embeddings):
-    PERSIST_DIR = "maths_db"
-    if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-        print("✅ Maths DB found — loading from disk...")
-        vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-    else:
-        print("🔨 Building Maths DB...")
-        loader = PyPDFLoader("maths.pdf")
-        docs   = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        split = splitter.split_documents(docs)
-        vs = Chroma.from_documents(documents=split, embedding=embeddings, persist_directory=PERSIST_DIR)
-        vs.persist()
-        print("✅ Maths DB built!")
 
-    retriever = vs.as_retriever(search_kwargs={"k": 10})
-    llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0.5, max_output_tokens=1000)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a kind and friendly primary school teacher.
-You teach the Mathematics subject.
+def read_pdf_chunks(pdf_path, chunk_size=500, overlap=100):
+    """Read PDF and split into overlapping text chunks."""
+    doc   = fitz.open(pdf_path)
+    text  = "\n".join(page.get_text() for page in doc)
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = " ".join(words[i:i+chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+        i += chunk_size - overlap
+    return chunks
+
+def get_embeddings(texts):
+    """Get embeddings from Google API for a list of texts."""
+    result = client.models.embed_content(
+        model="models/text-embedding-004",
+        contents=texts,
+    )
+    return np.array([e.values for e in result.embeddings], dtype=np.float32)
+
+def cosine_similarity(query_vec, doc_vecs):
+    """Compute cosine similarity between query and all docs."""
+    q = query_vec / (np.linalg.norm(query_vec) + 1e-10)
+    d = doc_vecs / (np.linalg.norm(doc_vecs, axis=1, keepdims=True) + 1e-10)
+    return d @ q
+
+def build_index(pdf_path, index_path):
+    """Build or load a simple FAISS-free vector index (numpy + pickle)."""
+    if os.path.exists(index_path):
+        print(f"✅ Loading index from {index_path}...")
+        with open(index_path, "rb") as f:
+            return pickle.load(f)
+
+    print(f"🔨 Building index from {pdf_path}...")
+    chunks = read_pdf_chunks(pdf_path)
+    # embed in batches of 50 (API limit)
+    all_vecs = []
+    for i in range(0, len(chunks), 50):
+        batch = chunks[i:i+50]
+        vecs  = get_embeddings(batch)
+        all_vecs.append(vecs)
+    vectors = np.vstack(all_vecs)
+    index   = {"chunks": chunks, "vectors": vectors}
+    with open(index_path, "wb") as f:
+        pickle.dump(index, f)
+    print(f"✅ Index built and saved to {index_path}!")
+    return index
+
+def retrieve(query, index, k=8):
+    """Retrieve top-k most relevant chunks for a query."""
+    q_vec   = get_embeddings([query])[0]
+    scores  = cosine_similarity(q_vec, index["vectors"])
+    top_k   = np.argsort(scores)[::-1][:k]
+    return [index["chunks"][i] for i in top_k]
+
+def ask_gemini(question, context, system_prompt):
+    """Call Gemini with context and question."""
+    prompt = f"""System: {system_prompt}
+
+Context from textbook:
+{context}
+
+Student Question: {question}
+
+Answer:"""
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.5,
+            max_output_tokens=1000,
+        )
+    )
+    return response.text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUBJECT CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+SUBJECTS_CONFIG = {
+    "maths": {
+        "pdf":    "maths.pdf",
+        "index":  "maths_index.pkl",
+        "system": """You are a kind and friendly primary school teacher teaching Mathematics.
 Rules:
 - Always answer in very simple English.
 - Speak politely and encourage the student.
-- Explain step by step.
-- Use small numbers and easy examples.
-- If needed, show the calculation clearly.
-- Make maths easy and fun for the student.
-- Explain so that a 2nd standard student can understand.
-- If the answer is not in the context, politely say "I don't know"."""),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "Context:\n{context}\n\nStudent Question:\n{question}")
-    ])
-    memory = ChatMessageHistory()
-    chain  = RunnableWithMessageHistory(prompt | llm, lambda s: memory,
-                input_messages_key="question", history_messages_key="history")
-    return retriever, chain
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MARATHI
-# ══════════════════════════════════════════════════════════════════════════════
-def build_marathi(embeddings):
-    PERSIST_DIR = "marathi_db"
-    if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-        print("✅ Marathi DB found — loading from disk...")
-        vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-    else:
-        print("🔨 Building Marathi DB...")
-        doc  = fitz.open("marathi.pdf")
-        docs = []
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if text.strip():
-                docs.append(Document(page_content=text, metadata={"page": page_num}))
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        split = splitter.split_documents(docs)
-        vs = Chroma.from_documents(documents=split, embedding=embeddings, persist_directory=PERSIST_DIR)
-        vs.persist()
-        print("✅ Marathi DB built!")
-
-    retriever = vs.as_retriever(search_kwargs={"k": 10})
-    llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.5, max_output_tokens=1000)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """तुम्ही एक प्रेमळ प्राथमिक शाळेचे शिक्षक आहात.
-तुम्ही मराठी विषय शिकवता.
+- Explain step by step with small numbers and easy examples.
+- Show calculations clearly.
+- Make maths easy and fun for a 2nd standard student.
+- If the answer is not in the context, politely say I dont know."""
+    },
+    "marathi": {
+        "pdf":    "marathi.pdf",
+        "index":  "marathi_index.pkl",
+        "system": """तुम्ही एक प्रेमळ प्राथमिक शाळेचे मराठी शिक्षक आहात.
 नियम:
-- नेहमी मराठी भाषेत उत्तर द्या.
-- देवनागरी लिपी वापरा.
-- विद्यार्थ्याशी प्रेमाने आणि प्रोत्साहन देऊन बोला.
-- खूप सोप्या शब्दांत समजावून सांगा.
+- नेहमी मराठी भाषेत देवनागरी लिपीत उत्तर द्या.
+- विद्यार्थ्याशी प्रेमाने बोला.
+- खूप सोप्या शब्दांत पायरी-पायरीने समजावून सांगा.
 - २रीच्या विद्यार्थ्याला समजेल असे बोला.
-- छोट्या उदाहरणांचा वापर करा.
-- उत्तर पायरी-पायरीने द्या.
-- जर माहिती नसेल तर नम्रपणे सांगा "मला माहीत नाही"."""),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "Context:\n{context}\n\nStudent Question:\n{question}")
-    ])
-    memory = ChatMessageHistory()
-    chain  = RunnableWithMessageHistory(prompt | llm, lambda s: memory,
-                input_messages_key="question", history_messages_key="history")
-    return retriever, chain
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENGLISH
-# ══════════════════════════════════════════════════════════════════════════════
-def build_english(embeddings):
-    PERSIST_DIR = "english_db"
-    if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-        print("✅ English DB found — loading from disk...")
-        vs = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
-    else:
-        print("🔨 Building English DB...")
-        loader = PyPDFLoader("english.pdf")
-        docs   = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        split = splitter.split_documents(docs)
-        vs = Chroma.from_documents(documents=split, embedding=embeddings, persist_directory=PERSIST_DIR)
-        vs.persist()
-        print("✅ English DB built!")
-
-    retriever = vs.as_retriever(search_kwargs={"k": 10})
-    llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash-lite", temperature=0.5, max_output_tokens=1000)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a kind and friendly primary school teacher.
-You teach the English subject.
+- जर माहिती नसेल तर नम्रपणे सांगा मला माहीत नाही."""
+    },
+    "english": {
+        "pdf":    "english.pdf",
+        "index":  "english_index.pkl",
+        "system": """You are a kind and friendly primary school teacher teaching English.
 Rules:
-- Always answer in simple English.
+- Always answer in simple English with very easy words.
 - Speak politely and encourage the student.
-- Use very easy words.
-- Explain so that a 2nd standard student can understand.
-- Give small examples if possible.
-- Explain step by step.
-- If the answer is not in the context, politely say "I don't know"."""),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "Context:\n{context}\n\nStudent Question:\n{question}")
-    ])
-    memory = ChatMessageHistory()
-    chain  = RunnableWithMessageHistory(prompt | llm, lambda s: memory,
-                input_messages_key="question", history_messages_key="history")
-    return retriever, chain
+- Explain step by step with small examples.
+- Explain so a 2nd standard student can understand.
+- If the answer is not in the context, politely say I dont know."""
+    }
+}
 
+# In-memory conversation history per session
+conversation_history = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STARTUP — load in background so port binds immediately
+#  STARTUP — build indexes in background
 # ══════════════════════════════════════════════════════════════════════════════
-retriever_mt = retriever_m = retriever_eg = None
-chain_mt     = chain_m    = chain_eg     = None
-_app_ready   = False
+indexes   = {}
+_app_ready = False
 
 def _load_all():
-    global retriever_mt, chain_mt, retriever_m, chain_m, retriever_eg, chain_eg, _app_ready
+    global indexes, _app_ready
     try:
-        print("⏳ Loading single embeddings model...")
-        # Use ONE small model for ALL subjects — saves ~400MB RAM on free tier
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"batch_size": 8}
-        )
-        print("✅ Embeddings ready!")
-        print("\n📚 Setting up subjects...")
-        retriever_mt, chain_mt = build_maths(embeddings)
-        retriever_m,  chain_m  = build_marathi(embeddings)
-        retriever_eg, chain_eg = build_english(embeddings)
+        print("\n📚 Building/loading indexes...")
+        for subject, cfg in SUBJECTS_CONFIG.items():
+            indexes[subject] = build_index(cfg["pdf"], cfg["index"])
         _app_ready = True
-        print("🎉 All subjects ready!\n")
+        print("🎉 All indexes ready!\n")
     except Exception as e:
         print(f"❌ Startup error: {e}")
+        import traceback; traceback.print_exc()
 
-# start in background — port binds instantly, models load in parallel
 threading.Thread(target=_load_all, daemon=True).start()
 
 
@@ -1186,39 +1171,42 @@ def check_and_update(question, context):
 @app.route("/ask", methods=["POST"])
 def ask():
     if not _app_ready:
-        return jsonify({"error": "⏳ Server is still warming up! Please wait 30–60 seconds and try again."}), 503
+        return jsonify({"error": "⏳ Server is warming up! Please wait 30 seconds and try again."}), 503
 
     data     = request.get_json()
     subject  = data.get("subject", "").lower()
     question = data.get("question", "").strip()
     session  = data.get("session_id", "default")
 
-    if not question: return jsonify({"error": "Empty question"}), 400
+    if not question:           return jsonify({"error": "Empty question"}), 400
+    if subject not in indexes: return jsonify({"error": "Unknown subject"}), 400
 
-    SUBJECTS = {
-        "maths":   {"chain": chain_mt, "retriever": retriever_mt},
-        "marathi": {"chain": chain_m,  "retriever": retriever_m},
-        "english": {"chain": chain_eg, "retriever": retriever_eg},
-    }
-
-    if subject not in SUBJECTS: return jsonify({"error": "Unknown subject"}), 400
-
-    retriever = SUBJECTS[subject]["retriever"]
-    chain     = SUBJECTS[subject]["chain"]
-    docs      = retriever.invoke(question)
-    context   = "\n".join([d.page_content for d in docs])
+    # retrieve context
+    chunks  = retrieve(question, indexes[subject], k=8)
+    context = "\n\n".join(chunks)
 
     allowed, reason = check_and_update(question, context)
     if not allowed: return jsonify({"error": reason}), 429
 
+    # build conversation context (last 4 exchanges)
+    history = conversation_history.get(session + subject, [])
+    history_text = ""
+    for h in history[-4:]:
+        history_text += f"Student: {h['q']}\nTeacher: {h['a']}\n\n"
+
+    system = SUBJECTS_CONFIG[subject]["system"]
+    full_system = system
+    if history_text:
+        full_system += f"\n\nPrevious conversation:\n{history_text}"
+
     try:
-        response = chain.invoke(
-            {"context": context, "question": question},
-            config={"configurable": {"session_id": session}}
-        )
-        return jsonify({"answer": response.content})
+        answer = ask_gemini(question, context, full_system)
+        # save to history
+        if session + subject not in conversation_history:
+            conversation_history[session + subject] = []
+        conversation_history[session + subject].append({"q": question, "a": answer})
+        return jsonify({"answer": answer})
     except Exception as e:
-        import re
         err = str(e)
         if "429" in err or "RESOURCE_EXHAUSTED" in err:
             delay = re.search(r'retry in (\d+)', err)
@@ -1240,11 +1228,6 @@ def status():
             "day_requests":    f"{state['day_requests']} / {LIMITS['rpd_max']}",
         })
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  RUN
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
